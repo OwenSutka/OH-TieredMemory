@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "tiered-memory": {
+      "type": "stdio",
+      "command": "./bin/tiered-memory-mcp",
+      "env": {
+        "TIERED_MEMORY_DATA": "${PLUGIN_DATA}"
+      }
+    }
+  }
+}
