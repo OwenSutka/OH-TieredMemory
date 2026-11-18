@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.uv/
+
+# --- Test / lint caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Local runtime data (never published) ---
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.onnx
+*.log
+deliverables/
+
+# --- Secrets / local config (must never exist here; blocked by guardrail) ---
+.env
+.env.*
+*.key
+*.pem
+*.p12
+secrets/
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+desktop.ini
