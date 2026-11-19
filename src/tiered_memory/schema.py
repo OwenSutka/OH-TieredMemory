@@ -11,8 +11,16 @@ second process that loses the race re-reads the winner's store instead of
 failing. A failed bootstrap never unlinks the file, not even one this call
 created: another process may already hold it open and be about to bootstrap a
 store into it, and unlinking the path would strand that store in an orphaned
-inode. An empty leftover file is indistinguishable from a fresh store, so the
-next open initialises it.
+inode.
+
+A pre-existing file is gated whatever its size. An empty leftover with no log
+beside it is indistinguishable from a fresh store and is initialised; an empty
+file whose log still holds pages belongs to a store that lost its identity and
+is refused rather than overwritten.
+
+The store path is contained before anything is created or opened: the leaf may
+not be a symlink and the resolved path must stay inside its directory (and
+inside the configured ``tiers/``, when the path is addressed through it).
 
 ``sqlite-vec`` is optional. This module never imports it at import time, and a
 store whose extension cannot load is still opened with
@@ -22,6 +30,7 @@ store whose extension cannot load is still opened with
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib
 import logging
 import os
@@ -34,6 +43,8 @@ from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
 from typing import Any
+
+from . import config
 
 __all__ = [
     "BUSY_TIMEOUT_SECONDS",
@@ -48,6 +59,8 @@ __all__ = [
     "SchemaError",
     "SchemaVersionError",
     "StoreIdentityMismatch",
+    "StorePathError",
+    "is_lock_contention",
     "open_store",
     "read_meta",
 ]
@@ -67,6 +80,18 @@ _PROBE_MILLISECONDS = 200
 
 #: Attempts at the bootstrap before a persistent lock is reported as a failure.
 _CREATE_ATTEMPTS = 5
+
+#: Attempts at snapshotting a store whose log is being checkpointed underneath
+#: the gate. A peer deleting its ``-wal`` is ordinary WAL churn, not a defect.
+_SNAPSHOT_ATTEMPTS = 5
+
+#: How long the gate waits for a concurrent creator's first page before it
+#: concludes a zero-byte file is genuinely empty. ``_ensure_file`` publishes
+#: the name before SQLite writes page 1, so a peer can observe a 0-byte main
+#: file beside a log that is not yet meaningful.
+_FIRST_PAGE_WAIT_SECONDS = 0.05
+
+_SNAPSHOT_PREFIX = "tiered-memory-gate-"
 
 #: Bumped whenever the DDL in plan §4 changes; the gate compares against it.
 SCHEMA_VERSION = 1
@@ -187,6 +212,18 @@ class StoreIdentityMismatch(SchemaError):
     """The store's recorded tier/scope is not the one the caller asked for."""
 
 
+class StorePathError(SchemaError, config.ConfigError):
+    """The store path would leave the plugin's data root.
+
+    A symlink at the store's leaf, or a ``tiers/`` directory that is (or
+    resolves through) a symlink, would place the database -- and its
+    ``-wal``/``-shm`` sidecars -- outside ``PLUGIN_DATA``. This is a refusal,
+    never a degraded open, because writing there is the defect. It is both a
+    ``SchemaError`` (the store cannot be served) and a ``ConfigError`` (the
+    configured layout is unusable), so either layer's callers catch it.
+    """
+
+
 class EmbeddingDimensionMismatch(RuntimeError):
     """The store's vectors and the requested embedding width disagree.
 
@@ -242,11 +279,15 @@ def open_store(
     Raises:
         ValueError: ``tier`` is not one of ``VALID_TIERS``, or ``scope_key`` is
             not a ``str``; nothing is opened.
+        StorePathError: ``path`` is a symlink, or resolves outside its directory
+            (or outside ``tiers/`` when addressed through it). Nothing outside
+            the store's directory is created or written.
         EmbeddingDimensionMismatch: ``embedding_dim`` or the value recorded in
             ``meta`` differs from ``EMBEDDING_DIMENSION``. A refused open does
             not create, rewrite or delete anything.
-        SchemaVersionError: an existing store is unversioned or carries a
-            version this module cannot serve. Facts are never dropped.
+        SchemaVersionError: an existing store is unversioned, carries a version
+            this module cannot serve, or lost its main file while its log still
+            holds pages. Facts are never dropped.
         StoreIdentityMismatch: the store records a different tier or
             ``scope_key`` than the caller asked for.
         IncompleteSchemaError: the store is missing part of the §4 schema, or
@@ -266,8 +307,12 @@ def open_store(
         raise EmbeddingDimensionMismatch(EMBEDDING_DIMENSION, embedding_dim)
 
     target = Path(path)
+    _guard_store_path(target)
     created = _ensure_file(target)
-    if _has_content(target):
+    if not created:
+        # A file that pre-existed is gated no matter its size: a store truncated
+        # to zero bytes still owns the identity its meta recorded, and a crashed
+        # journal may be the only remaining copy of it.
         _gate_read_only(target, tier=tier, scope_key=scope_key)
 
     conn: sqlite3.Connection | None = None
@@ -291,7 +336,7 @@ def open_store(
                 # the bootstrap done, the pragmas can be applied now.
                 _apply_pragmas(conn)
         except sqlite3.OperationalError as exc:
-            if created or not _is_busy(exc):
+            if created or not is_lock_contention(exc):
                 raise
             _LOGGER.warning("%s is locked; returning it without syncing state: %s", target, exc)
     except BaseException:
@@ -300,25 +345,79 @@ def open_store(
     return conn
 
 
-def _has_content(target: Path) -> bool:
+def _guard_store_path(target: Path) -> None:
+    """Refuse a store path that could place the database outside its directory.
+
+    The leaf is the only component the caller controls, so it must be a regular
+    name (not a symlink, dangling or not) directly inside its directory. When
+    the path is addressed through the configured ``tiers/``, that directory is
+    resolved once and the resolved target must stay inside it, which also
+    rejects a ``tiers/`` that is itself a symlink.
+    """
+    if target.is_symlink():
+        raise StorePathError(
+            f"{target} is a symlink; refusing to open it as a memory store because "
+            "SQLite would write the database and its sidecars through the link"
+        )
+    parent = target.parent
+    if parent.is_symlink():
+        raise StorePathError(f"{parent} is a symlink; refusing to write memory stores through it")
     try:
-        return target.stat().st_size > 0
-    except OSError:
-        return False
+        resolved_parent = parent.resolve(strict=True)
+        resolved = target.resolve(strict=False)
+    except OSError as exc:
+        raise StorePathError(f"cannot resolve the store path {target}: {exc}") from exc
+    if resolved.parent != resolved_parent or resolved.name != target.name:
+        raise StorePathError(
+            f"{target} resolves to {resolved}, outside its directory {resolved_parent}; "
+            "refusing to open it as a memory store"
+        )
+    _guard_configured_tiers(target, resolved_parent)
+
+
+def _guard_configured_tiers(target: Path, resolved_parent: Path) -> None:
+    """Keep a store addressed through ``tiers/`` inside the resolved tiers dir."""
+    if not os.environ.get(config.DATA_ENV, "").strip():
+        # No plugin layout is configured (a direct library call): the leaf and
+        # parent checks above already bound the path.
+        return
+    tiers = config.tiers_dir()
+    if target.parent != tiers:
+        return
+    resolved_tiers = tiers.resolve()
+    if resolved_tiers != resolved_parent or not target.resolve().is_relative_to(resolved_tiers):
+        raise StorePathError(
+            f"{target} resolves outside the tiers directory {resolved_tiers}; "
+            "refusing to write the memory store there"
+        )
 
 
 def _ensure_file(target: Path) -> bool:
     """Create ``target`` if absent; report whether this call created it.
 
-    ``O_EXCL`` never truncates a file another process made. Ownership is
-    reported but deliberately unused for deletion: a file this call created may
-    already be open in another process that is bootstrapping a store into it, so
-    nothing is ever unlinked on failure.
+    ``O_EXCL`` never truncates a file another process made, and ``O_NOFOLLOW``
+    on a directory descriptor makes the final component impossible to redirect
+    through a symlink planted between the containment check and this call.
+    Ownership is reported but deliberately unused for deletion: an unlink on
+    failure is never safe (see ``_release``).
     """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        dir_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise StorePathError(f"cannot open the store directory {target.parent}: {exc}") from exc
+    try:
+        handle = os.open(target.name, flags, 0o600, dir_fd=dir_fd)
     except FileExistsError:
         return False
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise StorePathError(
+                f"{target} is a symlink; refusing to create a memory store through it"
+            ) from exc
+        raise
+    finally:
+        os.close(dir_fd)
     os.close(handle)
     return True
 
@@ -352,14 +451,112 @@ def _gate_read_only(target: Path, *, tier: str, scope_key: str) -> None:
     ``immutable=1`` lets SQLite read the main file without creating
     ``-wal``/``-shm`` sidecars or taking locks, so a refusal leaves the file
     byte-identical. That only holds when the main file is authoritative on its
-    own. A ``-wal`` with uncheckpointed pages, or a hot ``-journal``, means the
-    newest state lives beside the store; reading it in place would create a
-    ``-shm`` there, so the files are copied aside and gated in the copy.
+    own, i.e. when no log beside it holds newer pages.
+
+    A ``-wal`` that still has its ``-shm`` is a *live* store -- the normal state
+    for a long-lived server -- and SQLite hands a read-only handle a consistent
+    snapshot through that shared memory without creating a file, so it is gated
+    in place. The main file and the WAL are never written; the only bytes a
+    reader may touch are in the existing ``-shm``, which every reader of a live
+    WAL updates and which is not durable store content. Only a ``-wal`` with no
+    ``-shm`` (a crashed writer), an unusable one, or a hot ``-journal`` needs
+    the log's pages copied aside, so the original directory stays untouched.
+
+    A store that pre-existed and is now zero bytes cannot be read at all. When a
+    ``-wal`` or ``-shm`` sits beside it, the store lost its main file while in
+    use, so the open is refused instead of bootstrapping a new identity over
+    it. Only an empty file with nothing but, at most, a bootstrap in flight is
+    the fresh ``touch`` case.
+
+    A peer may checkpoint or close between the check and the copy, deleting the
+    log underneath the gate. That is WAL churn, not a defect: the snapshot is
+    retried, and if the log keeps vanishing the main file is gated immutably,
+    which is the only thing that cannot be raced away.
     """
-    if _has_log(target):
-        _inspect_copy(target, tier=tier, scope_key=scope_key)
+    try:
+        size = target.stat().st_size
+    except OSError as exc:
+        # ``_ensure_file`` reported that the file exists, so a failing stat is
+        # an unusable path, never an empty store to bootstrap.
+        raise SchemaError(f"cannot stat the store {target}: {exc}") from exc
+    if size == 0:
+        size = _await_first_page(target)
+    if size == 0:
+        if _lost_main_file(target):
+            raise SchemaVersionError(
+                f"store {target.name} is empty but its log or shared memory still holds "
+                "state, so the store it belonged to lost its main file. This plugin "
+                f"requires schema_version {SCHEMA_VERSION}; restore the file or delete "
+                "the store."
+            )
         return
+    for attempt in range(1, _SNAPSHOT_ATTEMPTS + 1):
+        if not _has_log(target):
+            _inspect_read_only(target, "mode=ro&immutable=1", tier=tier, scope_key=scope_key)
+            return
+        if _wal_is_live(target):
+            try:
+                _inspect_read_only(target, "mode=ro", tier=tier, scope_key=scope_key)
+                return
+            except sqlite3.OperationalError:
+                # A stale shared-memory file a crashed writer left behind cannot
+                # be initialised through a read-only handle; the copy below
+                # rebuilds the index from the WAL and reports the real verdict.
+                pass
+        try:
+            _inspect_copy(target, tier=tier, scope_key=scope_key)
+            return
+        except FileNotFoundError:
+            if attempt == _SNAPSHOT_ATTEMPTS:
+                break
+            time.sleep(_RETRY_SECONDS * attempt)
     _inspect_read_only(target, "mode=ro&immutable=1", tier=tier, scope_key=scope_key)
+
+
+def _await_first_page(target: Path) -> int:
+    """Wait briefly for a peer that created ``target`` to write page 1; return its size.
+
+    ``_ensure_file`` creates the name with ``O_EXCL`` and returns before SQLite
+    has initialised the file, so a second opener can legitimately see 0 bytes
+    beside a ``-wal`` that the creator is about to fill. Waiting distinguishes
+    that race from a store someone truncated to zero, which stays zero.
+    """
+    deadline = time.monotonic() + _FIRST_PAGE_WAIT_SECONDS
+    while True:
+        try:
+            size = target.stat().st_size
+        except OSError:
+            return 0
+        if size > 0 or time.monotonic() >= deadline:
+            return size
+        time.sleep(_RETRY_SECONDS / 5)
+
+
+def _lost_main_file(target: Path) -> bool:
+    """Whether sidecars beside an empty ``target`` still belong to a real store.
+
+    Every store this module opens ends in WAL mode, so the newest committed
+    pages of a store nobody checkpointed live in its ``-wal``, and any live
+    writer keeps a ``-shm`` beside it. A main file of zero bytes next to either
+    is therefore a store that lost its main file: its identity cannot be read,
+    and bootstrapping a fresh one would record whatever ``scope_key`` the
+    caller happened to pass. That is the "truncated while in use" case, and it
+    is refused rather than silently rewritten.
+
+    A transient rollback journal is *not* evidence of that. A writer creating a
+    brand-new store publishes its ``O_EXCL`` name before SQLite writes page 1,
+    and the short-lived journal beside it belongs to a bootstrap in flight.
+    So an empty file with only a journal, or with nothing beside it at all, is
+    left to the fresh-store path -- which is what a ``touch``ed file needs.
+    """
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(target) + suffix)
+        try:
+            if sidecar.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _has_log(target: Path) -> bool:
@@ -374,16 +571,46 @@ def _has_log(target: Path) -> bool:
     return False
 
 
+def _wal_is_live(target: Path) -> bool:
+    """Whether the store's ``-wal`` is attached to the ``-shm`` of a live writer.
+
+    SQLite keeps the shared-memory file beside the WAL for as long as any
+    connection has the store open, so only a crashed writer leaves a ``-wal``
+    without one. Telling the two apart is what lets the normal case avoid both
+    the copy and a sidecar that a fresh read-only handle would create.
+    """
+    return Path(str(target) + "-wal").exists() and Path(str(target) + "-shm").exists()
+
+
 def _inspect_copy(target: Path, *, tier: str, scope_key: str) -> None:
-    """Gate a copy of ``target`` and its log so the original is untouched."""
-    with tempfile.TemporaryDirectory(prefix="tiered-memory-gate-") as scratch:
+    """Gate a point-in-time copy of ``target`` and its log; the original is untouched.
+
+    The copy is opened read-write on purpose: a hot journal (or a committed WAL
+    a crashed writer left behind) is only replayed by a writer, and a
+    read-only handle would instead fail with "attempt to write a readonly
+    database" or, worse for an ``immutable`` handle, read the main file as if
+    the log did not exist and report a missing ``schema_version``. The copy is
+    in a private temporary directory, so replaying its log is free and the
+    original directory is still never written.
+
+    Raises ``FileNotFoundError`` when the log that ``_has_log`` saw disappears
+    before it can be mirrored, so the caller retries and then gates the store in
+    whatever state it settled into. Skipping the vanished log instead would gate
+    a main file that is missing the newest committed pages.
+    """
+    with tempfile.TemporaryDirectory(prefix=_SNAPSHOT_PREFIX) as scratch:
         copy = Path(scratch) / target.name
         shutil.copyfile(target, copy)
+        mirrored = False
         for suffix in ("-wal", "-journal"):
             log = Path(str(target) + suffix)
-            if log.exists():
-                shutil.copyfile(log, Path(str(copy) + suffix))
-        _inspect_read_only(copy, "mode=ro", tier=tier, scope_key=scope_key)
+            if not log.exists():
+                continue
+            shutil.copyfile(log, Path(str(copy) + suffix))
+            mirrored = True
+        if not mirrored:
+            raise FileNotFoundError(f"{target}: the log disappeared before it could be read")
+        _inspect_read_only(copy, "mode=rw", tier=tier, scope_key=scope_key)
 
 
 def _inspect_read_only(target: Path, params: str, *, tier: str, scope_key: str) -> None:
@@ -470,7 +697,7 @@ def _sync_journal_pragmas(conn: sqlite3.Connection) -> bool:
     try:
         row = conn.execute("PRAGMA journal_mode").fetchone()
     except sqlite3.OperationalError as exc:
-        if not _is_busy(exc):
+        if not is_lock_contention(exc):
             raise
         # Cannot even read the header: the store is exclusively locked, so the
         # switch below cannot succeed either. Degrade without trying.
@@ -480,24 +707,32 @@ def _sync_journal_pragmas(conn: sqlite3.Connection) -> bool:
         try:
             _switch_to_wal(conn)
         except sqlite3.OperationalError as exc:
-            if not _is_busy(exc):
+            if not is_lock_contention(exc):
                 raise
             _LOGGER.warning("store is locked; leaving journal_mode unchanged: %s", exc)
             return False
     try:
         conn.execute("PRAGMA synchronous = NORMAL")
     except sqlite3.OperationalError as exc:
-        if not _is_busy(exc):
+        if not is_lock_contention(exc):
             raise
         _LOGGER.warning("store is locked; leaving synchronous unchanged: %s", exc)
         return False
     return True
 
 
-def _is_busy(exc: sqlite3.Error) -> bool:
-    """Whether ``exc`` means "another connection holds the store", not a defect."""
-    message = str(exc).lower()
-    return "locked" in message or "busy" in message
+def is_lock_contention(exc: sqlite3.Error) -> bool:
+    """Whether ``exc`` means "another connection holds the store", not a defect.
+
+    Classified by SQLite's own primary result code, never by the message:
+    ``SQLITE_BUSY`` and ``SQLITE_LOCKED`` (including their extended codes) are
+    contention, while the message text is not a contract and can quote a path
+    that happens to contain "locked" or "busy".
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(code, int):
+        return False
+    return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 def _switch_to_wal(conn: sqlite3.Connection) -> None:
@@ -513,7 +748,7 @@ def _switch_to_wal(conn: sqlite3.Connection) -> None:
             conn.execute("PRAGMA journal_mode = WAL")
             return
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+            if not is_lock_contention(exc) or time.monotonic() >= deadline:
                 raise
             time.sleep(_RETRY_SECONDS)
 
@@ -610,7 +845,7 @@ def _create_store(conn: sqlite3.Connection, *, tier: str, scope_key: str, vec_re
                 _bootstrap(conn, tier=tier, scope_key=scope_key, vec_ready=vec_ready)
             return False
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt == _CREATE_ATTEMPTS:
+            if not is_lock_contention(exc) or attempt == _CREATE_ATTEMPTS:
                 raise
             time.sleep(_RETRY_SECONDS)
     raise AssertionError("unreachable: the final attempt either returns or raises")
