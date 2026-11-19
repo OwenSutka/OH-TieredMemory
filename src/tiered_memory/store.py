@@ -114,6 +114,13 @@ def _open(
             raise
         conn.execute("COMMIT")
     finally:
+        if fail_open and _no_checkpoint_available():
+            # A hook's connection is closed microseconds after the commit; the
+            # full checkpoint that closing normally performs only duplicates the
+            # fsync the commit already paid, and it is ~11 ms of the hot path.
+            # The committed pages stay in the -wal, which the next open reads
+            # and the next checkpoint reclaims.
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
         conn.close()
 
 
@@ -154,6 +161,11 @@ def _begin(conn: sqlite3.Connection, *, path: Path, fail_open: bool) -> bool:
         return False
     conn.execute(f"PRAGMA busy_timeout = {int(schema.BUSY_TIMEOUT_SECONDS * 1000)}")
     return True
+
+
+def _no_checkpoint_available() -> bool:
+    """Whether this interpreter can suppress the close-time checkpoint."""
+    return hasattr(sqlite3.Connection, "setconfig")
 
 
 def _rollback(conn: sqlite3.Connection) -> None:

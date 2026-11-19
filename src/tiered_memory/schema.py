@@ -32,14 +32,17 @@ from __future__ import annotations
 import contextlib
 import errno
 import importlib
+import importlib.util
 import logging
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from importlib.machinery import EXTENSION_SUFFIXES
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -947,25 +950,50 @@ def _set_meta_value(conn: sqlite3.Connection, key: str, value: str) -> None:
 def _load_sqlite_vec(conn: sqlite3.Connection) -> bool:
     """Try to load the extension; ``False`` means the store is FTS-only.
 
-    Imported lazily and failure-tolerant on purpose: hooks open stores on the
-    hot path and must work on a machine that has no ``sqlite-vec`` wheel, a
-    broken one, or an extension that raises anything at all.
+    Loaded lazily and failure-tolerant on purpose: hooks open stores on the hot
+    path and must work on a machine that has no ``sqlite-vec`` wheel, a broken
+    one, or an extension that raises anything at all.
+
+    The extension file is loaded directly rather than through
+    ``sqlite_vec.load``: importing that package also imports ``numpy``, which
+    costs ~55 ms and would dominate a PostToolUse hook's whole budget. An
+    already-imported ``sqlite_vec`` module is honoured (tests and embedders
+    substitute one), so the substitution contract is unchanged.
     """
-    try:
-        module = importlib.import_module("sqlite_vec")
-    except Exception:  # noqa: BLE001 - an optional dependency must never break the hot path
-        return False
+    module = sys.modules.get("sqlite_vec")
+    if module is not None:
+        load: Any = getattr(module, "load", None)
+        if not callable(load):
+            return False
+        return _try_load_extension(conn, lambda: load(conn))
 
-    load: Any = getattr(module, "load", None)
-    if not callable(load):
+    extension = _sqlite_vec_path()
+    if extension is None:
         return False
+    return _try_load_extension(conn, lambda: conn.load_extension(str(extension)))
 
+
+def _try_load_extension(conn: sqlite3.Connection, load: Callable[[], None]) -> bool:
     try:
         conn.enable_load_extension(True)
-        load(conn)
-    except Exception:  # noqa: BLE001 - same: any loader failure means FTS-only
+        load()
+    except Exception:  # noqa: BLE001 - any loader failure means FTS-only
         return False
     finally:
         with contextlib.suppress(Exception):
             conn.enable_load_extension(False)
     return True
+
+
+def _sqlite_vec_path() -> Path | None:
+    """The wheel's loadable extension file, or ``None`` when it is unavailable."""
+    try:
+        spec = importlib.util.find_spec("sqlite_vec")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    package = Path(next(iter(spec.submodule_search_locations)))
+    candidates = [package / "vec0"]
+    candidates.extend(package / f"vec0{suffix}" for suffix in EXTENSION_SUFFIXES)
+    return next((candidate for candidate in candidates if candidate.is_file()), None)

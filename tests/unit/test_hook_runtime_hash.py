@@ -14,7 +14,7 @@ import hashlib
 from pathlib import Path
 
 #: sha256 of OpenHandsPlugins/tooling/templates/hook_runtime.py
-CANONICAL_SHA256 = "c12a266d89b58e3debae449a9674fd8cf48ea39f5d35472eabbc3bf8a4114d59"
+CANONICAL_SHA256 = "f952704a170935131e52f00edb626c4ea6a28d92b523bb0986df6e50aeeffffb"
 
 RUNTIME_FILENAME = "hook_runtime.py"
 

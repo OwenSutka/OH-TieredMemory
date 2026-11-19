@@ -1,0 +1,21 @@
+#!/bin/sh
+# Launcher for dev.openhands/hooks/*.py, invoked from hooks.json as
+# "${PLUGIN_ROOT}/bin/tiered-memory-hook <script>".
+#
+# Hooks run on the per-turn hot path and need stdlib only, so this uses the
+# system interpreter directly rather than `uv run`: paying Python-environment
+# resolution before every tool call would blow the PostToolUse latency budget.
+# Each script puts <root>/src on sys.path itself, so no install is required.
+set -u
+ROOT="${PLUGIN_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
+
+# The store resolves TIERED_MEMORY_DATA; the hook runner exports PLUGIN_DATA.
+# mcp.json performs the same mapping for the server, so without it here the
+# hooks would write to a different store than the one memory_* reads.
+if [ -z "${TIERED_MEMORY_DATA:-}" ] && [ -n "${PLUGIN_DATA:-}" ]; then
+    TIERED_MEMORY_DATA="$PLUGIN_DATA"
+    export TIERED_MEMORY_DATA
+fi
+
+PYTHON="${TIERED_MEMORY_PYTHON:-python3}"
+exec "$PYTHON" "$ROOT/dev.openhands/hooks/${1:?hook script name required}"

@@ -44,6 +44,7 @@ __all__ = [
     "HookContext",
     "HookResult",
     "log_dir",
+    "log_record",
     "run",
 ]
 
@@ -225,6 +226,32 @@ def _log(record: Mapping[str, Any]) -> None:
             handle.write(json.dumps(dict(record), separators=(",", ":")) + "\n")
     except OSError:
         return
+
+
+def log_record(
+    *,
+    name: str,
+    event: str,
+    tool: str = "",
+    session: str = "",
+    extra: Mapping[str, object] | None = None,
+) -> None:
+    """Append one hook-trail line outside a ``run`` invocation.
+
+    ``run`` logs after the handler returns, but a handler sometimes needs to
+    record something it decided to skip, and stderr is discarded by the runner.
+    This is that channel. It never raises.
+    """
+    record: dict[str, object] = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "plugin": name,
+        "event": event,
+        "tool": tool,
+        "session": session,
+    }
+    if extra:
+        record.update(extra)
+    _log(record)
 
 
 def _emit(result: HookResult | None) -> None:
