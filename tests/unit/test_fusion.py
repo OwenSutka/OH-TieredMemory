@@ -161,13 +161,28 @@ def test_hand_computed_fixture_order() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_two_day_old_decision_outranks_a_six_month_old_decision(
+def test_decisions_do_not_decay_so_recency_breaks_the_tie(
     conn: sqlite3.Connection,
 ) -> None:
+    """Durable kinds keep decay == 1.0, so age alone cannot rank them.
+
+    The two decisions below are otherwise identical, so they tie on fused score;
+    the recency tie-breaker is what puts the fresher one first. Age must NOT be
+    allowed to move the score, or `decision` would stop being durable.
+    """
     old = _write(conn, "decision sqlite one", kind="decision", seen_at=_NOW - timedelta(days=180))
     fresh = _write(conn, "decision sqlite two", kind="decision", seen_at=_NOW - timedelta(days=2))
 
-    assert [hit.id for hit in _recall(conn, "decision")] == [fresh, old]
+    hits = _recall(conn, "decision")
+
+    assert [hit.id for hit in hits] == [fresh, old]
+
+    # Durability is the invariant that matters, and it is about *decay*: age must
+    # not move the score. The two scores differ slightly because the keyword
+    # retriever ranks them 1 and 2, so their RRF terms differ — that is ranking,
+    # not decay. Assert decay directly instead of comparing fused scores.
+    assert search.decay("decision", age_days=180) == 1.0
+    assert search.decay("decision", age_days=2) == 1.0
 
 
 def test_a_todo_decays_while_a_preference_does_not(conn: sqlite3.Connection) -> None:
